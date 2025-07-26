@@ -142,24 +142,28 @@ async def create_chat_completion(request: ChatCompletionRequest, authorized: boo
     if request.stream:
         raise HTTPException(status_code=400, detail="Streaming not supported.")
     
-    # Build conversation prompt from all messages
-    conversation = ""
+    # Extract the last user message for translation
+    user_message = None
+    system_prompt = None
+    
     for msg in request.messages:
         if msg.role == "system":
-            conversation += f"System: {msg.content}\n"
+            system_prompt = msg.content
         elif msg.role == "user":
-            conversation += f"User: {msg.content}\n"
-        elif msg.role == "assistant":
-            conversation += f"Assistant: {msg.content}\n"
+            user_message = msg.content  # Keep updating to get the last one
     
-    if not conversation.strip():
-        raise HTTPException(status_code=400, detail="No messages found.")
+    if not user_message:
+        raise HTTPException(status_code=400, detail="No user message found.")
     
     request_id = f"req_{uuid.uuid4().hex[:8]}"
     logger.info(f"[{request_id}] Received chat completion request.")
     try:
-        # Use the full conversation as prompt
-        prompt = conversation + "Assistant:"
+        # Check if this looks like a translation request
+        if system_prompt and "translation" in system_prompt.lower():
+            prompt = f'Translate the following English text to Chinese.\nEnglish: "{user_message}"\nChinese:'
+        else:
+            # General chat format
+            prompt = f'User: {user_message}\nAssistant:'
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
             outputs = model.generate(
@@ -176,12 +180,24 @@ async def create_chat_completion(request: ChatCompletionRequest, authorized: boo
         seq_count = request.n or 1
         # token counts
         prompt_tokens = inputs.input_ids.size(1)
-        # Use first sequence to calculate completion tokens
-        total_output_len = outputs[0].size(1)
-        completion_tokens = total_output_len - prompt_tokens
+        
+        # Handle both single and multiple sequences
+        if seq_count == 1:
+            # Single sequence case
+            total_output_len = outputs.size(1)
+            completion_tokens = total_output_len - prompt_tokens
+        else:
+            # Multiple sequences case
+            total_output_len = outputs[0].size(1)
+            completion_tokens = total_output_len - prompt_tokens
+            
         total_tokens = prompt_tokens + completion_tokens
+        
         for idx in range(seq_count):
-            gen_ids = outputs[idx][prompt_tokens:]
+            if seq_count == 1:
+                gen_ids = outputs[0][prompt_tokens:]
+            else:
+                gen_ids = outputs[idx][prompt_tokens:]
             text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
             # Apply stop sequences if provided
             if request.stop:
