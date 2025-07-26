@@ -160,7 +160,7 @@ async def create_chat_completion(request: ChatCompletionRequest, authorized: boo
     try:
         # Check if this looks like a translation request
         if system_prompt and "translation" in system_prompt.lower():
-            prompt = f'Translate the following English text to Chinese.\nEnglish: "{user_message}"\nChinese:'
+            prompt = f'你是一位专业的翻译大师，擅长将学术文献从英文精准地翻译为中文。在翻译过程中，要确保译文忠实于原文，同时符合中文的表达习惯，使译文通顺、准确、专业。\nEnglish: "{user_message}"\nChinese:'
         else:
             # General chat format
             prompt = f'User: {user_message}\nAssistant:'
