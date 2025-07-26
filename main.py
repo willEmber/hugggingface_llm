@@ -141,14 +141,25 @@ class ChatCompletionResponse(BaseModel):
 async def create_chat_completion(request: ChatCompletionRequest, authorized: bool = Depends(verify_key)):
     if request.stream:
         raise HTTPException(status_code=400, detail="Streaming not supported.")
-    user_message = next((msg.content for msg in reversed(request.messages) if msg.role == 'user'), None)
-    if not user_message:
-        raise HTTPException(status_code=400, detail="No user message found.")
+    
+    # Build conversation prompt from all messages
+    conversation = ""
+    for msg in request.messages:
+        if msg.role == "system":
+            conversation += f"System: {msg.content}\n"
+        elif msg.role == "user":
+            conversation += f"User: {msg.content}\n"
+        elif msg.role == "assistant":
+            conversation += f"Assistant: {msg.content}\n"
+    
+    if not conversation.strip():
+        raise HTTPException(status_code=400, detail="No messages found.")
     
     request_id = f"req_{uuid.uuid4().hex[:8]}"
-    logger.info(f"[{request_id}] Received translation request.")
+    logger.info(f"[{request_id}] Received chat completion request.")
     try:
-        prompt = f'Translate the following English text to Chinese.\nEnglish: "{user_message}"\nChinese:'
+        # Use the full conversation as prompt
+        prompt = conversation + "Assistant:"
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
             outputs = model.generate(
@@ -179,7 +190,7 @@ async def create_chat_completion(request: ChatCompletionRequest, authorized: boo
                     if s and s in text:
                         text = text.split(s)[0].strip()
             choices.append(Choice(index=idx, message=Message(role="assistant", content=text)))
-        logger.info(f"[{request_id}] Translation successful.")
+        logger.info(f"[{request_id}] Chat completion successful.")
         return ChatCompletionResponse(
             model=request.model,
             choices=choices,
