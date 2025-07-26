@@ -6,11 +6,13 @@ import logging
 import traceback
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from typing import List, Optional
+from typing import List, Optional, Union, Dict
 
 import torch
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -80,6 +82,29 @@ async def lifespan(app: FastAPI):
     logger.info("Application lifespan: shutdown sequence initiated.")
 
 app = FastAPI(lifespan=lifespan)
+# Custom exception handlers to match OpenAI API error format
+@app.exception_handler(HTTPException)
+async def openai_http_exception_handler(request, exc: HTTPException):
+    # map status codes to OpenAI error types
+    if exc.status_code == 401:
+        err_type = "authentication_error"
+    elif exc.status_code == 400:
+        err_type = "invalid_request_error"
+    elif exc.status_code == 429:
+        err_type = "rate_limit_error"
+    else:
+        err_type = "server_error"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"message": exc.detail, "type": err_type, "param": "", "code": None}}
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=400,
+        content={"error": {"message": "Invalid request", "type": "invalid_request_error", "param": "", "code": None}}
+    )
 
 async def verify_key(authorization: str = Header(...)):
     if authorization != f"Bearer {API_SECRET_KEY}":
@@ -90,13 +115,26 @@ async def verify_key(authorization: str = Header(...)):
 class Message(BaseModel):
     role: str; content: str
 class ChatCompletionRequest(BaseModel):
-    model: str; messages: List[Message]; temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0; max_tokens: Optional[int] = 512; stream: Optional[bool] = False
+    model: str
+    messages: List[Message]
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 1.0
+    n: Optional[int] = 1
+    max_tokens: Optional[int] = 512
+    stream: Optional[bool] = False
+    stop: Optional[Union[str, List[str]]] = None
+    
+    class Config:
+        extra = "ignore"
 class Choice(BaseModel):
     index: int; message: Message; finish_reason: str = "stop"
 class ChatCompletionResponse(BaseModel):
-    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}"); object: str = "chat.completion"
-    created: int = Field(default_factory=lambda: int(time.time())); model: str; choices: List[Choice]
+    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
+    object: str = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[Choice]
+    usage: Optional[Dict[str, int]] = None
 
 # --- 5. API Endpoints (Unchanged, with added logging) ---
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
@@ -114,16 +152,38 @@ async def create_chat_completion(request: ChatCompletionRequest, authorized: boo
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
             outputs = model.generate(
-                **inputs, max_new_tokens=request.max_tokens, temperature=request.temperature,
-                top_p=request.top_p, pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id, num_return_sequences=1
+                **inputs,
+                max_new_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                num_return_sequences=request.n or 1
             )
-        generated_ids = outputs[0][len(inputs.input_ids[0]):]
-        response_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        # Build choices list and calculate token usage
+        choices = []
+        seq_count = request.n or 1
+        # token counts
+        prompt_tokens = inputs.input_ids.size(1)
+        # Use first sequence to calculate completion tokens
+        total_output_len = outputs[0].size(1)
+        completion_tokens = total_output_len - prompt_tokens
+        total_tokens = prompt_tokens + completion_tokens
+        for idx in range(seq_count):
+            gen_ids = outputs[idx][prompt_tokens:]
+            text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            # Apply stop sequences if provided
+            if request.stop:
+                stops = [request.stop] if isinstance(request.stop, str) else request.stop
+                for s in stops:
+                    if s and s in text:
+                        text = text.split(s)[0].strip()
+            choices.append(Choice(index=idx, message=Message(role="assistant", content=text)))
         logger.info(f"[{request_id}] Translation successful.")
         return ChatCompletionResponse(
             model=request.model,
-            choices=[Choice(index=0, message=Message(role="assistant", content=response_text))]
+            choices=choices,
+            usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
         )
     except Exception as e:
         logger.error(f"[{request_id}] Error during request processing: {e}\n{traceback.format_exc()}")
